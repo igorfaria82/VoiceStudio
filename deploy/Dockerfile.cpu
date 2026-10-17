@@ -1,0 +1,52 @@
+# Native CPU build; no CUDA base, GPU runtime, or architecture emulation.
+FROM oven/bun:1.4.2-alpine AS frontend-builder
+WORKDIR /app
+COPY package.json bun.lock ./
+COPY electron/package.json ./electron/
+COPY config/ ./config/
+RUN bun install --frozen-lockfile
+COPY frontend/ ./frontend/
+COPY electron/ ./electron/
+RUN bun run --cwd electron build:web
+
+FROM rust:1.90-slim-bookworm AS rust-toolchain
+
+FROM python:3.12-slim-bookworm AS runtime
+WORKDIR /app
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/backend \
+    HF_HOME=/app/omnivoice_data/huggingface \
+    OMNIVOICE_SERVER_MODE=1 \
+    OMNIVOICE_DEVICE=cpu \
+    OMNIVOICE_BIND_HOST=0.0.0.0 \
+    OMP_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    CARGO_BUILD_JOBS=1 \
+    CARGO_HOME=/usr/local/cargo \
+    RUSTUP_HOME=/usr/local/rustup
+COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo
+COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup
+ENV PATH=/usr/local/cargo/bin:$PATH
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential pkg-config cmake ffmpeg libsndfile1 curl \
+    && rm -rf /var/lib/apt/lists/*
+RUN python -m pip install --no-cache-dir uv==0.11.6
+COPY pyproject.toml uv.lock README.md ./
+COPY omnivoice/ ./omnivoice/
+# sphn 0.2.1 bundles Opus with an old CMake policy floor. Apply only at build.
+RUN CMAKE_POLICY_VERSION_MINIMUM=3.5 uv sync --python /usr/local/bin/python --frozen --no-default-groups \
+    --group cpu --no-editable --no-cache
+ENV PATH=/app/.venv/bin:$PATH
+RUN python -c "import torch, torchaudio, torchvision; assert torch.version.cuda is None and torch.version.hip is None; from torchvision.ops import nms; assert nms(torch.tensor([[0.,0.,1.,1.]]), torch.tensor([1.]), 0.5).tolist() == [0]; print('CPU torch native ops verified')"
+COPY backend/ ./backend/
+COPY config/ ./config/
+COPY alembic.ini ./
+# Keep AGPL and bundled model notices available in the distributed image.
+COPY LICENSE* ./
+COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
+EXPOSE 3900
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=5 \
+    CMD ["python", "backend/docker_entrypoint.py", "--health-check"]
+VOLUME ["/app/omnivoice_data"]
+ENTRYPOINT ["python", "backend/docker_entrypoint.py"]
